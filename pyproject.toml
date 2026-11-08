@@ -1,0 +1,20 @@
+[project]
+name = "distributed-job-queue"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "jayqss", email = "joellkebret05@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.162.2",
+    "redis>=8.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+distributed-job-queue = "distributed_job_queue:main"
+
+[tool.uv]
+package = false
