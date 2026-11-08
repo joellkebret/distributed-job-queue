@@ -2,6 +2,7 @@
 # as part of a consumer group.
 
 from shared.redis_client import redis_client
+from worker.processor import process_csv
 from redis.exceptions import ResponseError
 import redis
 import time
@@ -43,9 +44,9 @@ while True:
                 job_id = message_data["job_id"]
                 filename = message_data["filename"]
 
-                # Processing logic...
-                print(f"Processing {job_id}: {filename}")
-                time.sleep(1)
+                # Store processing results
+                results = process_csv(filename)
+                print(f"Completed job {job_id}: {results}")
 
                 # send the acknoledgement
                 redis_client.xack("jobs", "csv-workers", message_id)

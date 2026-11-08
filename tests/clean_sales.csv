@@ -1,0 +1,5 @@
+order_id,customer,amount,quantity
+1001,Alice,25.50,2
+1002,Bob,40.00,1
+1003,Charlie,12.75,3
+1004,Dana,99.99,1
