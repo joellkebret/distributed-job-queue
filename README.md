@@ -171,6 +171,7 @@ Concurrency tests use threads with separate database connections and Redis consu
 - Input and output use local filesystem paths. Workers on different machines need shared storage. Matching filenames in multiple input directories are ambiguous, and changing an input between attempts can change the output.
 - CSV processing keeps unique rows in memory. There is no job timeout, cancellation, or file-size limit.
 - There is no authentication, rate limiting, metrics endpoint, or automatic stream retention. The health endpoint checks Redis only.
+- Database initialization creates missing tables but does not migrate existing schemas. Redis connection settings are currently hardcoded for local use.
 
 ## To Be Added
 - File uploads through FastAPI for asynchronous CSV processing
