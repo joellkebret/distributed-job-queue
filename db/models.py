@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime
+from sqlalchemy import String, DateTime, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
@@ -7,6 +7,7 @@ class Base(DeclarativeBase):
 
 class Job(Base):
     __tablename__ = "jobs"
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     job_id: Mapped[str] = mapped_column(
         String(36),

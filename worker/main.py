@@ -3,6 +3,7 @@
 
 from shared.redis_client import redis_client
 from worker.processor import process_csv
+from worker.dlq import send_to_dlq, mark_dead, reconcile_dead_jobs
 from redis.exceptions import ResponseError
 from db.database import SessionLocal, engine
 from sqlalchemy import select, text
@@ -18,6 +19,7 @@ CONSUMER_NAME = f"worker-{uuid4().hex}"
 MAX_ATTEMPTS = 3
 BASE_DELAY = 5
 MAX_DELAY = 60
+DLQ_RECONCILE_INTERVAL = 30
 
 def schedule_retries():
     """Publish due retries before committing their queued state.
@@ -71,6 +73,8 @@ def _process_job(message_id, message_data):
 
         # Avoid processing completed or permanently failed jobs
         if db_job.status in ("completed", "dead"):
+            if db_job.status == "dead":
+                send_to_dlq(db_job)
             redis_client.xack("jobs", "csv-workers", message_id)
             return
 
@@ -100,13 +104,10 @@ def _process_job(message_id, message_data):
                 return
 
         # Stop jobs that have exhausted their attempts
+        # dead jobs go to the dlq
         if db_job.attempts >= MAX_ATTEMPTS:
-            db_job.status = "dead"
-            db_job.next_retry_at = None
-            db.commit()
-
+            mark_dead(db, db_job, db_job.last_error or "Maximum attempts exhausted")
             redis_client.xack("jobs", "csv-workers", message_id)
-            print(f"Job {job_id} exhausted retries")
             return
 
         filename = db_job.filename
@@ -119,18 +120,15 @@ def _process_job(message_id, message_data):
 
         try:
             # Process the CSV file
-            results = process_csv(filename)
+            results = process_csv(filename, job_id)
 
         except Exception as e:
             db.rollback()
+            db_job.last_error = str(e)
 
             if db_job.attempts >= MAX_ATTEMPTS:
                 # No more retries
-                db_job.status = "dead"
-                db_job.next_retry_at = None
-                db.commit()
-
-                redis_client.xack("jobs", "csv-workers", message_id)
+                mark_dead(db, db_job, e)
                 print(f"Job {job_id} exhausted retries: {e}")
 
             else:
@@ -184,9 +182,13 @@ def main():
 
     # Recover pending jobs and listen for new jobs.
     claim_cursor = "0-0"
+    next_dlq_reconcile = 0
 
     while True:
         try:
+            if time.monotonic() >= next_dlq_reconcile:
+                reconcile_dead_jobs(SessionLocal)
+                next_dlq_reconcile = time.monotonic() + DLQ_RECONCILE_INTERVAL
             schedule_retries()
 
             claim_cursor, claimed_messages, *_ = redis_client.xautoclaim(
