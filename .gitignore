@@ -1,4 +1,13 @@
-.venv
+# Python
+__pycache__/
 *.pyc
+.venv/
+
+# Environment variables
 .env
-__pycahce__/
+
+# Generated CSV files
+output/
+
+# Local development files
+.vscode/

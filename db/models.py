@@ -1,10 +1,11 @@
-from sqlalchemy import create_engine, String
+from datetime import datetime, timezone
+from sqlalchemy import String, DateTime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     pass
 
-class Jobs(Base):
+class Job(Base):
     __tablename__ = "jobs"
 
     job_id: Mapped[str] = mapped_column(
@@ -22,5 +23,17 @@ class Jobs(Base):
     )
     filename: Mapped[str] = mapped_column(
         String(255),
+        nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
         nullable=False
     )
