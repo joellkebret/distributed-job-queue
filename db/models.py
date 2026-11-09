@@ -37,3 +37,8 @@ class Job(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False
     )
+
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True
+    )
