@@ -1,7 +1,8 @@
 # FastAPI producer that accepts job requests and publishes them
 # to a Redis Stream for asynchronous processing by workers.
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from models.job import JobRequest
 from shared.redis_client import redis_client
@@ -20,6 +21,20 @@ app = FastAPI(
 def health():
     redis_client.ping()
     return {"Status" : "OK", "redis" : "connected"}
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str, db: Session = Depends(get_db)):
+
+    match = db.scalars(
+        select(Job)
+        .where(Job.job_id == job_id)        
+    ).first()
+
+    if not match:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return match
+            
 
 @app.post("/jobs", status_code=202)
 def create_job(job: JobRequest, db: Session = Depends(get_db)):
