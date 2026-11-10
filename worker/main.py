@@ -78,20 +78,27 @@ def _process_job(message_id, message_data):
             redis_client.xack("jobs", "csv-workers", message_id)
             return
 
-        # Failed jobs are durably scheduled by PostgreSQL, not XAUTOCLAIM.
+        # PostgreSQL already stores this failed job's retry deadline.
+        # Acknowledge the old message; schedule_retries() publishes a new one
+        # when the deadline arrives.
         if db_job.status == "failed":
             redis_client.xack("jobs", "csv-workers", message_id)
             return
 
         retry_attempt = message_data.get("retry_attempt")
         if retry_attempt is not None:
+            # The message carries the attempt count from when it was scheduled.
             expected = int(retry_attempt)
             valid_attempt = (
+                # The job is still waiting for this scheduled retry.
                 db_job.status == "retry_queued" and db_job.attempts == expected
             ) or (
+                # Processing started and incremented attempts, but may have
+                # crashed. Allow the reclaimed message to recover the job.
                 db_job.status == "processing" and db_job.attempts > expected
             )
             if not valid_attempt:
+                # This message no longer matches the job's retry state.
                 redis_client.xack("jobs", "csv-workers", message_id)
                 return
         elif db_job.status == "retry_queued":
