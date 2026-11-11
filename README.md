@@ -80,7 +80,7 @@ Start a worker in another terminal:
 uv run python -m worker.main
 ```
 
-Run the same worker command in additional terminals to process jobs concurrently. All workers must be able to access the same input and output files. Stop local services with `docker compose stop`.
+Run the same worker command in additional terminals to process jobs concurrently. All workers need read/write access to the configured S3 bucket and a writable local output directory. Stop local services with `docker compose stop`.
 
 ## API
 
@@ -117,7 +117,19 @@ The status response includes `job_id`, `filename`, `status`, `attempts`, `last_e
 Invoke-RestMethod -Method Post -Uri http://localhost:8000/jobs -ContentType 'application/json' -Body '{"filename":"duplicate_rows.csv"}'
 ```
 
-The processor searches recursively under `tests/` for the submitted filename. Place additional CSV inputs there with unique filenames. Output is written to `output/cleaned_<job_id>.csv`. There is no file upload or download endpoint.
+The processor downloads `input/<filename>` from the S3 bucket configured by `S3_BUCKET` into a temporary directory. Set `AWS_PROFILE`, `AWS_DEFAULT_REGION`, and `S3_BUCKET` in `.env`, and authenticate the profile before starting a worker. For example, upload the sample first:
+
+```sh
+aws s3 cp tests/duplicate_rows.csv s3://YOUR-BUCKET/input/duplicate_rows.csv --profile job-queue
+```
+
+Submit `duplicate_rows.csv` as the filename. Downloaded inputs are cleaned up after reading, including on failure. The worker writes the cleaned CSV locally to `output/cleaned_<job_id>.csv`, then uploads it to the same key in S3. A job only completes after the upload succeeds; upload errors use the existing retry flow. Processor results include `output_s3_key`, which the worker logs. There is no file upload or download endpoint.
+
+Download the result using the job ID:
+
+```sh
+aws s3 cp s3://YOUR-BUCKET/output/cleaned_<job_id>.csv cleaned.csv --profile job-queue
+```
 
 ## Processing and recovery
 
@@ -168,14 +180,13 @@ Concurrency tests use threads with separate database connections and Redis consu
 ## Known limitations
 
 - PostgreSQL commits and Redis publication are not atomic. Initial submission can leave a queued record without a stream message if publication fails; there is no outbox or queued-job reconciliation. Redis data loss can also strand queued work.
-- Input and output use local filesystem paths. Workers on different machines need shared storage. Matching filenames in multiple input directories are ambiguous, and changing an input between attempts can change the output.
+- Inputs use S3 keys based on filenames; uploading to the same key changes the input, and retries read the current object. Outputs are uploaded to S3, but local output copies are also retained without automatic cleanup.
 - CSV processing keeps unique rows in memory. There is no job timeout, cancellation, or file-size limit.
 - There is no authentication, rate limiting, metrics endpoint, or automatic stream retention. The health endpoint checks Redis only.
 - Database initialization creates missing tables but does not migrate existing schemas. Redis connection settings are currently hardcoded for local use.
 
 ## To Be Added
 - File uploads through FastAPI for asynchronous CSV processing
-- S3-compatible object storage for uploaded files and processed results
 - Downloadable processed files through the API
 - Job monitoring and performance metrics
 - Worker scalability and throughput benchmarks

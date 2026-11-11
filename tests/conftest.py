@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from uuid import uuid4
 from types import SimpleNamespace
 
@@ -10,7 +11,39 @@ os.environ.setdefault('DATABASE_URL', 'postgresql+psycopg://localhost:5433/postg
 
 
 @pytest.fixture
-def services(monkeypatch, tmp_path):
+def s3_inputs(monkeypatch):
+    from botocore.exceptions import ClientError
+    from worker import processor
+
+    objects = {"input/good.csv": b"a,b\n1,2\n1,2\n"}
+    downloads = []
+    uploads = []
+
+    def download_file(bucket, key, destination):
+        assert bucket == "test-input-bucket"
+        downloads.append(Path(destination))
+        if key not in objects:
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "CSV file not found"}},
+                "HeadObject",
+            )
+        Path(destination).write_bytes(objects[key])
+
+    def upload_file(source, bucket, key):
+        assert bucket == "test-input-bucket"
+        objects[key] = Path(source).read_bytes()
+        uploads.append(key)
+
+    monkeypatch.setenv("S3_BUCKET", "test-input-bucket")
+    monkeypatch.setattr(
+        processor, "s3_client",
+        SimpleNamespace(download_file=download_file, upload_file=upload_file),
+    )
+    return SimpleNamespace(objects=objects, downloads=downloads, uploads=uploads)
+
+
+@pytest.fixture
+def services(monkeypatch, tmp_path, s3_inputs):
     from sqlalchemy import create_engine, text
     from sqlalchemy.orm import sessionmaker
     from redis import Redis
