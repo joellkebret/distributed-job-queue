@@ -6,19 +6,25 @@ import pytest
 from fastapi.testclient import TestClient
 from redis.exceptions import ConnectionError
 from db.models import Job
+from listener import main as listener
 
 pytestmark = pytest.mark.integration
 
 
-def test_api_submission_status_validation_and_processing(services):
+def test_upload_submission_status_and_processing(services, monkeypatch):
     s = services
+    monkeypatch.setattr(listener, 'SessionLocal', s.sessions)
+    monkeypatch.setattr(listener, 'redis_client', s.redis)
     with TestClient(s.api.app) as client:
         assert client.get('/health').status_code == 200
-        assert client.post('/jobs', json={}).status_code == 422
+        assert client.post('/jobs', json={'filename': 'good.csv'}).status_code == 404
         assert client.get('/jobs/missing').status_code == 404
-        response = client.post('/jobs', json={'filename': 'good.csv'})
-        assert response.status_code == 202
-        job_id = response.json()['job_id']
+        record = {
+            'eventSource': 'aws:s3', 'eventName': 'ObjectCreated:Put',
+            's3': {'bucket': {'name': 'test-input-bucket'},
+                   'object': {'key': 'input/good.csv', 'sequencer': '001'}},
+        }
+        job_id = listener.create_job(record)
         assert client.get('/jobs/' + job_id).json()['status'] == 'queued'
         message = s.read()
         assert message[1]['job_id'] == job_id
@@ -28,6 +34,9 @@ def test_api_submission_status_validation_and_processing(services):
         s.main.process_job(*message)
         assert s.state(job_id).attempts == 1
         assert s.redis.xpending('jobs', 'csv-workers')['pending'] == 0
+        length = s.redis.xlen('jobs')
+        assert listener.create_job(record) == job_id
+        assert s.redis.xlen('jobs') == length
 
 
 def test_retries_backoff_exhaustion_and_dlq(services):

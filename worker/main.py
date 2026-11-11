@@ -174,7 +174,7 @@ def _process_job(message_id, message_data):
         print(f"Acknowledged {job_id} processing {filename}")
 
 
-def main():
+def main(stop_event=None):
     # Create a worker group
     try:
         redis_client.xgroup_create(
@@ -191,7 +191,8 @@ def main():
     claim_cursor = "0-0"
     next_dlq_reconcile = 0
 
-    while True:
+    # The autoscaler signals retirement without interrupting an active job.
+    while stop_event is None or not stop_event.is_set():
         try:
             if time.monotonic() >= next_dlq_reconcile:
                 reconcile_dead_jobs(SessionLocal)
@@ -209,6 +210,9 @@ def main():
 
             for message_id, message_data in claimed_messages:
                 process_job(message_id, message_data)
+
+            if stop_event is not None and stop_event.is_set():
+                break
 
             response = redis_client.xreadgroup(
                 groupname="csv-workers",

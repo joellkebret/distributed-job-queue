@@ -1,12 +1,13 @@
 # Distributed Job Queue
 
-A Python job queue for asynchronous CSV processing. FastAPI accepts jobs, Redis Streams distributes work across workers, and PostgreSQL stores job state, attempts, and retry deadlines. Workers remove duplicate CSV rows and write one output file per job.
+A Python job queue for asynchronous CSV processing. S3 uploads trigger notifications to SQS; a local listener creates jobs in PostgreSQL and publishes them to Redis Streams. A local autoscaler adjusts the worker count as unfinished jobs accumulate. Workers remove duplicate CSV rows and upload cleaned outputs to S3. FastAPI provides job status and health endpoints.
 
 ## Tech stack
 
 - Python 3.13+, FastAPI, Pydantic, and Uvicorn
 - Redis 7 Streams and consumer groups
 - PostgreSQL 18, SQLAlchemy, and Psycopg
+- Amazon S3 and SQS, accessed through Boto3
 - Docker Compose for local services, uv for Python dependencies
 - pytest for unit and integration tests
 
@@ -14,26 +15,33 @@ A Python job queue for asynchronous CSV processing. FastAPI accepts jobs, Redis 
 
 ```mermaid
 flowchart LR
-    Client -->|Submit or check a job| API[FastAPI]
-    API -->|Store and read job state| DB[(PostgreSQL)]
-    API -->|Publish job| Queue[Redis jobs stream]
+    Client -->|Upload CSV| S3[(S3 bucket)]
+    S3 -->|Input upload notifications| SQS[SQS upload queue]
+    SQS --> Listener[Local listener]
+    Listener -->|Create job| DB[(PostgreSQL)]
+    Listener -->|Publish job| Queue[Redis jobs stream]
+    Client -->|Check job| API[FastAPI]
+    API -->|Read job state| DB
     Queue -->|csv-workers consumer group| Workers[Python workers]
     Workers -->|State, locks, retry deadlines| DB
+    DB -->|Unfinished job count| Autoscaler[Local worker autoscaler]
+    Autoscaler -->|Start and gracefully retire processes| Workers
     Workers -->|Publish due retries| Queue
-    CSV[Local CSV files] --> Workers
-    Workers --> Output[Cleaned CSV files]
+    S3 -->|Download input| Workers
+    Workers -->|Upload cleaned CSV| S3
     Workers -->|Exhausted attempts| DLQ[Redis jobs:dead stream]
 ```
 
-The API and workers run on the host. Docker Compose runs PostgreSQL and Redis with persistent volumes; Redis has append-only persistence enabled. Each worker processes one job at a time and uses a unique consumer name.
+The API, listener, autoscaler, and workers run on the host. S3 and SQS run in AWS. Docker Compose runs PostgreSQL and Redis with persistent volumes; Redis has append-only persistence enabled. Each worker processes one job at a time and uses a unique consumer name.
 
 ## Implemented features
 
-- Job submission and status lookup through HTTP.
+- Automatic job creation from S3 upload notifications, with status lookup through HTTP.
 - CSV row deduplication that preserves the header and first occurrence order.
 - Counts for total, unique, and duplicate rows, plus missing values in retained rows. These results are logged by the worker.
 - Persistent job state and exponential retry scheduling.
 - Concurrent workers with per-job PostgreSQL locking.
+- Local worker autoscaling based on unfinished job counts.
 - Recovery of unacknowledged Redis messages and idempotent file output.
 - Dead-letter publication with deduplication and periodic repair.
 
@@ -48,9 +56,15 @@ POSTGRES_USER=jobqueue
 POSTGRES_PASSWORD=localdev
 POSTGRES_DB=jobqueue
 DATABASE_URL=postgresql+psycopg://jobqueue:localdev@localhost:5433/jobqueue
+AWS_PROFILE=job-queue
+AWS_DEFAULT_REGION=us-east-2
+S3_BUCKET=YOUR-BUCKET
+SQS_QUEUE_URL=https://sqs.us-east-2.amazonaws.com/YOUR-ACCOUNT-ID/YOUR-QUEUE
 ```
 
 These credentials are for local development. Existing PostgreSQL volumes retain their original database and credentials.
+
+Use your own bucket, queue URL, and region. Create a Standard SQS queue in the bucket's region. Allow the bucket to send messages to the queue and configure S3 `ObjectCreated` notifications with prefix `input/` and suffix `.csv`. The local AWS identity needs S3 read/write access and SQS `ReceiveMessage` and `DeleteMessage` permissions. Authenticate it with `aws login --profile job-queue` before starting the listener and workers.
 
 Install dependencies and start the services:
 
@@ -74,13 +88,46 @@ Start the API:
 uv run uvicorn api.main:app --reload
 ```
 
-Start a worker in another terminal:
+Start the worker autoscaler in another terminal:
 
 ```sh
-uv run python -m worker.main
+uv run python -m worker.autoscale
 ```
 
-Run the same worker command in additional terminals to process jobs concurrently. All workers need read/write access to the configured S3 bucket and a writable local output directory. Stop local services with `docker compose stop`.
+The autoscaler manages 1 to 4 local workers by default. See the configuration and scaling rules below. Use `uv run python -m worker.main` instead if you want one manually managed worker.
+
+Start the upload listener in another terminal:
+
+```sh
+uv run python -m listener.main
+```
+
+All workers need read/write access to the configured S3 bucket and a writable local output directory. Stop local services with `docker compose stop` after stopping the listener and workers.
+
+## Worker autoscaling
+
+The autoscaler checks PostgreSQL for unfinished jobs and chooses a worker count using:
+
+```text
+target = ceil(unfinished_jobs / JOBS_PER_WORKER)
+target = bounded between MIN_WORKERS and MAX_WORKERS
+```
+
+Queued, retry-queued, processing, and failed jobs whose retry time has arrived count toward demand. Including processing jobs prevents the pool from shrinking merely because workers claimed their messages. Completed/dead jobs, future retries, and retained Redis stream history do not count. At least one worker stays running to schedule retries and recover pending messages.
+
+Set these optional variables in `.env` to override the defaults:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MIN_WORKERS` | `1` | Minimum running workers; must be at least 1. |
+| `MAX_WORKERS` | `4` | Maximum managed worker processes. |
+| `JOBS_PER_WORKER` | `5` | Target unfinished jobs per worker. |
+| `WORKER_SCALE_INTERVAL` | `5` | Seconds between demand checks. |
+| `WORKER_SCALE_DOWN_DELAY` | `30` | Seconds of lower demand before retiring extra workers. |
+
+With the defaults, 1 to 5 unfinished jobs use one worker, 6 to 10 use two, 11 to 15 use three, and 16 or more use four. Scaling up happens on the next check. Extra workers finish their current job before retiring, and retiring processes still count toward the maximum until they exit. Crashed workers are replaced on a subsequent check. If PostgreSQL cannot be queried, the pool is left running and the query is retried.
+
+Ctrl+C asks managed workers to finish and exit. Run only one autoscaler per local queue; its worker limit applies to its own children, not separately launched workers or other machines. This scales local processes, not AWS servers, and does not split one CSV across workers. Capacity is based on job count, not CSV file size or row count.
 
 ## API
 
@@ -89,20 +136,9 @@ Interactive API documentation is available at `http://localhost:8000/docs`.
 | Endpoint | Behavior |
 | --- | --- |
 | `GET /health` | Pings Redis and returns its connection status. |
-| `POST /jobs` | Stores a job, publishes it to Redis, and returns HTTP 202. |
 | `GET /jobs/{job_id}` | Returns the stored job record, or HTTP 404 if it does not exist. |
 
-Submit one of the included CSV files:
-
-```sh
-curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '{"filename":"duplicate_rows.csv"}'
-```
-
-Response:
-
-```json
-{"job_id":"<generated-uuid>","status":"queued"}
-```
+Create jobs by uploading CSVs to the bucket's `input/` prefix. The listener logs the job ID for each upload; no HTTP submission is needed. Previously uploaded objects do not generate new notifications retroactively, so upload a sample again after enabling notifications.
 
 Check the job and Redis health:
 
@@ -111,19 +147,15 @@ curl http://localhost:8000/jobs/<generated-uuid>
 curl http://localhost:8000/health
 ```
 
-The status response includes `job_id`, `filename`, `status`, `attempts`, `last_error`, `next_retry_at`, `created_at`, and `updated_at`. On Windows PowerShell, use `Invoke-RestMethod` for submission:
+The status response includes `job_id`, `filename`, `status`, `attempts`, `last_error`, `next_retry_at`, `created_at`, and `updated_at`.
 
-```powershell
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/jobs -ContentType 'application/json' -Body '{"filename":"duplicate_rows.csv"}'
-```
-
-The processor downloads `input/<filename>` from the S3 bucket configured by `S3_BUCKET` into a temporary directory. Set `AWS_PROFILE`, `AWS_DEFAULT_REGION`, and `S3_BUCKET` in `.env`, and authenticate the profile before starting a worker. For example, upload the sample first:
+The processor downloads `input/<filename>` from the S3 bucket configured by `S3_BUCKET` into a temporary directory. With the listener and workers running, upload a sample:
 
 ```sh
 aws s3 cp tests/duplicate_rows.csv s3://YOUR-BUCKET/input/duplicate_rows.csv --profile job-queue
 ```
 
-Submit `duplicate_rows.csv` as the filename. Downloaded inputs are cleaned up after reading, including on failure. The worker writes the cleaned CSV locally to `output/cleaned_<job_id>.csv`, then uploads it to the same key in S3. A job only completes after the upload succeeds; upload errors use the existing retry flow. Processor results include `output_s3_key`, which the worker logs. There is no file upload or download endpoint.
+The upload automatically creates a job. Downloaded inputs are cleaned up after reading, including on failure. The worker writes the cleaned CSV locally to `output/cleaned_<job_id>.csv`, then uploads it to the same key in S3. A job only completes after the upload succeeds; upload errors use the existing retry flow. Processor results include `output_s3_key`, which the worker logs. There is no file upload or download endpoint.
 
 Download the result using the job ID:
 
@@ -151,7 +183,7 @@ Workers use `XAUTOCLAIM` to reclaim messages idle for at least 60 seconds. This 
 
 Completed jobs are acknowledged without reprocessing. CSV output uses a stable job-specific filename, a temporary file, and atomic replacement. Reprocessing the same job with unchanged input produces the same output rather than additional files.
 
-Delivery can occur more than once; this is not an exactly-once system. A new HTTP submission always creates a new job ID, even for the same filename.
+Delivery can occur more than once; this is not an exactly-once system. The listener derives a stable job ID from the bucket, object key, and upload sequencer, so redelivery of the same notification reuses its PostgreSQL job. A new upload to the same key creates a new job. The listener saves the job before publishing to Redis and deletes the SQS notification only after all its records have been handled. Redelivery repairs interrupted Redis publication; duplicate Redis messages remain possible and go through the worker's existing locks and state checks.
 
 ### Dead-letter queue
 
@@ -167,9 +199,11 @@ With the Compose services running and `.env` configured:
 uv run pytest -q
 uv run pytest -q -m integration
 uv run pytest -q tests/test_processor.py
+uv run pytest -q tests/test_listener.py
+uv run pytest -q tests/test_autoscale.py
 ```
 
-Tests cover submission and status, CSV output, retry delays and caps, exhaustion, publication failures, DLQ repair, consumer-group delivery, XAUTOCLAIM recovery, and concurrent workers.
+Tests cover upload notification parsing, duplicate notifications, interrupted job publication, acknowledgment after success, status lookup, CSV output, retry delays and caps, exhaustion, DLQ repair, consumer-group delivery, XAUTOCLAIM recovery, and concurrent workers. Autoscaler tests cover demand counting, worker limits, delayed scale-down, crash replacement, and finishing received jobs before retirement. Listener unit tests use SQLite and mock SQS and Redis; S3 downloads and uploads are mocked in processor and worker integration tests.
 
 Integration tests use real PostgreSQL transactions, advisory locks, Redis Streams, and Lua scripts. They create a unique PostgreSQL schema and Redis key prefix per test and clean them up afterward. The database account needs permission to create schemas. CSV tests use temporary directories.
 
@@ -177,18 +211,13 @@ Set `TEST_DATABASE_URL` or `TEST_REDIS_URL` to override integration service addr
 
 Concurrency tests use threads with separate database connections and Redis consumer identities. Recovery tests recreate abandoned processing state and reclaim real pending messages; they do not forcibly kill worker processes.
 
+Local validation completed with 49 passing tests. Separate live checks verified an S3 upload traveling through SQS, PostgreSQL, Redis, and a worker to a cleaned S3 output, plus three real Windows worker processes starting and gracefully shrinking to one. These live checks are separate from the automated suite; running pytest does not create S3 output objects.
+
 ## Known limitations
 
-- PostgreSQL commits and Redis publication are not atomic. Initial submission can leave a queued record without a stream message if publication fails; there is no outbox or queued-job reconciliation. Redis data loss can also strand queued work.
+- PostgreSQL commits and Redis publication are not atomic. SQS redelivery repairs listener publication failures while the notification remains available. There is no transactional outbox or queued-job reconciliation after acknowledgment; Redis data loss can still strand queued work. Malformed notifications remain in SQS for retry until retention expires; no SQS DLQ is required or configured by the application.
 - Inputs use S3 keys based on filenames; uploading to the same key changes the input, and retries read the current object. Outputs are uploaded to S3, but local output copies are also retained without automatic cleanup.
 - CSV processing keeps unique rows in memory. There is no job timeout, cancellation, or file-size limit.
 - There is no authentication, rate limiting, metrics endpoint, or automatic stream retention. The health endpoint checks Redis only.
 - Database initialization creates missing tables but does not migrate existing schemas. Redis connection settings are currently hardcoded for local use.
-
-## To Be Added
-- File uploads through FastAPI for asynchronous CSV processing
-- Downloadable processed files through the API
-- Job monitoring and performance metrics
-- Worker scalability and throughput benchmarks
-- Support for additional job types beyond CSV processing
 
