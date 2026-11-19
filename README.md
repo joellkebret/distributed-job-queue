@@ -213,6 +213,59 @@ Concurrency tests use threads with separate database connections and Redis consu
 
 Local validation completed with 49 passing tests. Separate live checks verified an S3 upload traveling through SQS, PostgreSQL, Redis, and a worker to a cleaned S3 output, plus three real Windows worker processes starting and gracefully shrinking to one. These live checks are separate from the automated suite; running pytest does not create S3 output objects.
 
+## Throughput Benchmark
+
+### Results
+
+On November 19, 2026, all 36 measured batches completed (three repetitions per configuration, 1,980 jobs total) with zero retries, failures, or timeouts. The separate five-file smoke run completed at 1.532 jobs/sec.
+
+| Batch size (files) | CSV data rows/file | Workers | Median completed jobs/sec | Speedup vs 1 worker |
+| --- | --- | --- | --- | --- |
+| 10 | 100 | 1 | 2.352 | 1.00x |
+| 10 | 100 | 2 | 3.466 | 1.47x |
+| 10 | 100 | 4 | 4.448 | 1.89x |
+| 10 | 10,000 | 1 | 1.697 | 1.00x |
+| 10 | 10,000 | 2 | 3.794 | 2.24x |
+| 10 | 10,000 | 4 | 4.274 | 2.52x |
+| 100 | 100 | 1 | 3.702 | 1.00x |
+| 100 | 100 | 2 | 7.387 | 2.00x |
+| 100 | 100 | 4 | 8.120 | 2.19x |
+| 100 | 10,000 | 1 | 3.329 | 1.00x |
+| 100 | 10,000 | 2 | 5.180 | 1.56x |
+| 100 | 10,000 | 4 | 7.012 | 2.11x |
+
+Four workers improved median throughput by 1.89x to 2.52x across the four workloads. For 100-file batches, going from two to four workers added about 10% throughput at 100 rows per file and 35% at 10,000 rows per file. These runs include sequential S3 uploads and AWS latency, so they measure the whole pipeline under these test conditions.
+
+Timing starts just before the first sequential S3 upload and ends when PostgreSQL reports all jobs completed or dead, the runner observes a timeout, or a call fails. Each rate is completed jobs divided by elapsed seconds, including AWS delivery, queueing, processing, retries, and output uploads. Speedup divides each median by the one-worker median for the same workload. The JSONL output records environment, job states, exceptions, and timeouts. Failed or incomplete sets of repetitions do not contribute medians.
+
+### Run the benchmark
+
+Follow [Local setup](#local-setup) to start PostgreSQL, Redis, and the listener with an idle test bucket and queue. Stop any existing workers, then start a fixed pool in a separate PowerShell terminal:
+
+```powershell
+$env:MIN_WORKERS = $env:MAX_WORKERS = '1'
+uv run --locked python -m worker.autoscale
+```
+
+Equal limits disable demand-based scaling. Wait for the worker startup logs. From another terminal at the repository root, run the five-file smoke test:
+
+```powershell
+$Smoke = "output/benchmark-smoke-$(Get-Date -Format yyyyMMdd-HHmmss).jsonl"
+uv run --locked python benchmark.py --out $Smoke
+```
+
+For the full matrix, restart the pool with both limits set to the requested count at each prompt. The runner labels each result with `--workers` and expects that many workers to be running.
+
+```powershell
+$Results = "output/benchmark-$(Get-Date -Format yyyyMMdd-HHmmss).jsonl"
+foreach ($Workers in 1, 2, 4) {
+    [void](Read-Host "Restart the pool with $Workers workers, wait for startup, then press Enter")
+    uv run --locked python benchmark.py --workers $Workers --batches 10 100 --rows 100 10000 --repeats 3 --timeout 600 --out $Results
+    if ($LASTEXITCODE -ne 0) { throw "Benchmark stopped. See $Results." }
+}
+uv run --locked python benchmark.py --summary --out $Results
+```
+
 ## Known limitations
 
 - PostgreSQL commits and Redis publication are not atomic. SQS redelivery repairs listener publication failures while the notification remains available. There is no transactional outbox or queued-job reconciliation after acknowledgment; Redis data loss can still strand queued work. Malformed notifications remain in SQS for retry until retention expires; no SQS DLQ is required or configured by the application.
